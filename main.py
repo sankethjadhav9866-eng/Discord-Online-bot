@@ -1,25 +1,31 @@
-# main.py
-import discord
-from discord.ext import commands
-import os, random, json, sqlite3, asyncio
+
+import os
+import random
+import json
+import sqlite3
+import asyncio
 from datetime import datetime, timedelta
 
-# --- CONFIG ---
-PREFIX = "."
-OWNER_IDS = ["1405836534812508210", "1342508316911210551"]  # owners
-DAILY_REWARD = 5
-DB_FILE = "vortex.db"
-TOKEN = os.getenv("TOKEN")
+import discord
+from discord.ext import commands
 
-# --- INTENTS & BOT ---
+# ------------- CONFIG -------------
+PREFIX = "."
+OWNER_IDS = ["1405836534812508210", "1342508316911210551"]  # owner IDs as strings
+DB_FILE = "vortex.db"
+DAILY_REWARD = 5
+TOKEN = os.getenv("TOKEN")  # <- set this in your host env, do NOT hardcode
+
+# ------------- INTENTS & BOT -------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# --- DATABASE SETUP ---
+# ------------- DATABASE -------------
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 c = conn.cursor()
+
 c.execute("""CREATE TABLE IF NOT EXISTS balances (user_id TEXT PRIMARY KEY, balance INTEGER)""")
 c.execute("""CREATE TABLE IF NOT EXISTS daily (user_id TEXT PRIMARY KEY, last_claim TEXT)""")
 c.execute("""CREATE TABLE IF NOT EXISTS games (user_id TEXT PRIMARY KEY, type TEXT, data TEXT)""")
@@ -27,7 +33,7 @@ c.execute("""CREATE TABLE IF NOT EXISTS deposits (user_id TEXT PRIMARY KEY, used
 c.execute("""CREATE TABLE IF NOT EXISTS proofs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, amount INTEGER, attachments TEXT, ts TEXT)""")
 conn.commit()
 
-# --- DB HELPERS ---
+# ------------- DB HELPERS -------------
 def get_balance_db(user_id):
     c.execute("SELECT balance FROM balances WHERE user_id = ?", (str(user_id),))
     row = c.fetchone()
@@ -77,23 +83,47 @@ def get_deposits_list():
 def log_proof(user_id, amount, attachments):
     ts = datetime.utcnow().isoformat()
     c.execute("INSERT INTO proofs (user_id, amount, attachments, ts) VALUES (?, ?, ?, ?)",
-              (str(user_id), amount, json.dumps(attachments), ts))
+              (str(user_id), int(amount), json.dumps(attachments), ts))
     conn.commit()
 
-# --- EVENTS ---
+# ------------- ANTI-DUPLICATE / RATE GUARD -------------
+# per-user-per-command small debounce (seconds)
+_last_invocations = {}  # key: (user_id, command_name) -> timestamp
+
+def called_recently(user_id, cmd_name, cooldown_s=1.0):
+    key = (str(user_id), cmd_name)
+    now = asyncio.get_event_loop().time()
+    last = _last_invocations.get(key)
+    if last and (now - last) < cooldown_s:
+        return True
+    _last_invocations[key] = now
+    return False
+
+# ------------- EVENTS -------------
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    print("Make sure only ONE instance is running to avoid duplicate triggers.")
 
-# --- COMMANDS ---
+# ignore messages from bots (prevents loops)
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    await bot.process_commands(message)
 
+# ------------- COMMANDS -------------
+# BALANCE
 @bot.command()
 async def balance(ctx):
+    if called_recently(ctx.author.id, "balance"): return
     bal = get_balance_db(ctx.author.id)
     await ctx.send(f"💰 {ctx.author.mention}, your balance is **{bal} coins**.")
 
+# DAILY
 @bot.command()
 async def daily(ctx):
+    if called_recently(ctx.author.id, "daily"): return
     uid = str(ctx.author.id)
     last = get_daily(uid)
     now = datetime.utcnow()
@@ -105,8 +135,10 @@ async def daily(ctx):
     set_daily(uid, now.isoformat())
     await ctx.send(f"🎁 {ctx.author.mention} — you received **{DAILY_REWARD} coins**!")
 
+# TIP
 @bot.command()
 async def tip(ctx, member: discord.Member, amount: int):
+    if called_recently(ctx.author.id, "tip"): return
     if amount < 1:
         return await ctx.send("❌ Minimum tip is 1 coin.")
     sender = str(ctx.author.id)
@@ -116,16 +148,22 @@ async def tip(ctx, member: discord.Member, amount: int):
     add_balance_db(member.id, amount)
     await ctx.send(f"🤝 {ctx.author.mention} tipped {member.mention} **{amount} coins**!")
 
-@bot.command()
+# OPGIVE (owner only)
+@bot.command(name="opgive")
 async def opgive(ctx, member: discord.Member, amount: int):
+    if called_recently(ctx.author.id, "opgive"): return
     if str(ctx.author.id) not in OWNER_IDS:
         return await ctx.send("🚫 You don't have permission to use this command.")
+    if amount <= 0:
+        return await ctx.send("❌ Amount must be positive.")
+    # single add, safe via DB
     add_balance_db(member.id, amount)
     await ctx.send(f"💎 Gave {member.mention} **{amount} coins**.")
 
-# --- BLACKJACK ---
+# BLACKJACK (.hit / .stand via messages)
 @bot.command()
 async def blackjack(ctx, bet: int):
+    if called_recently(ctx.author.id, "blackjack"): return
     uid = str(ctx.author.id)
     if bet < 1 or get_balance_db(uid) < bet:
         return await ctx.send("❌ Invalid bet or insufficient balance.")
@@ -133,15 +171,14 @@ async def blackjack(ctx, bet: int):
     player = [random.randint(1,11), random.randint(1,11)]
     dealer = [random.randint(1,11), random.randint(1,11)]
 
-    async def total(hand):
+    def total(hand):
         t = sum(hand)
-        # adjust for aces (11 -> 1)
         while t > 21 and 11 in hand:
             hand[hand.index(11)] = 1
             t = sum(hand)
         return t
 
-    await ctx.send(f"🃏 Your cards: {player} (Total: {await total(player)})\nDealer shows: {dealer[0]} + ?\nType `.hit` or `.stand`.")
+    await ctx.send(f"🃏 Your cards: {player} (Total: {total(player)})\nDealer shows: {dealer[0]} + ?\nType `.hit` to draw or `.stand` to stop.")
 
     def check(m):
         return m.author == ctx.author and m.content.lower() in [".hit", ".stand"]
@@ -152,21 +189,20 @@ async def blackjack(ctx, bet: int):
         except asyncio.TimeoutError:
             add_balance_db(uid, bet)  # refund on timeout
             return await ctx.send("⏰ Time's up — game cancelled, bet refunded.")
-
         if msg.content.lower() == ".hit":
             card = random.randint(1,11)
             player.append(card)
-            t = await total(player)
+            t = total(player)
             if t > 21:
                 return await ctx.send(f"🃏 You drew {card}. Total {t}. 💥 Busted! You lost {bet} coins.")
             else:
                 await ctx.send(f"🃏 You drew {card}. Total now {t}. Type `.hit` or `.stand`.")
-        else:  # stand
-            pt = await total(player)
-            dt = await total(dealer)
+        else:
+            pt = total(player)
+            dt = total(dealer)
             while dt < 17:
                 dealer.append(random.randint(1,11))
-                dt = await total(dealer)
+                dt = total(dealer)
             await ctx.send(f"Dealer: {dealer} (Total: {dt})")
             if dt > 21 or pt > dt:
                 winnings = bet * 2
@@ -179,9 +215,10 @@ async def blackjack(ctx, bet: int):
                 await ctx.send(f"💀 Dealer won — you lost {bet} coins.")
             return
 
-# --- MINES ---
+# MINES
 @bot.command()
 async def mines(ctx, bet: int):
+    if called_recently(ctx.author.id, "mines"): return
     uid = str(ctx.author.id)
     if bet < 1 or get_balance_db(uid) < bet:
         return await ctx.send("❌ Invalid bet or insufficient balance.")
@@ -189,10 +226,11 @@ async def mines(ctx, bet: int):
     safe = random.sample(range(1,26), 5)
     game = {"bet": bet, "safe": safe, "picked": [], "safe_picks": 0}
     set_game(uid, "mines", game)
-    await ctx.send("💣 Mines started! Pick squares 1–25 using `.pick <number>`. Cashout anytime with `.cashout`. Each safe pick gives +2 coins immediately.")
+    await ctx.send("💣 Mines started! Pick squares 1–25 using `.pick <number>`. Cashout with `.cashout`. Each safe pick gives +2 coins instantly.")
 
 @bot.command()
 async def pick(ctx, number: int):
+    if called_recently(ctx.author.id, "pick"): return
     uid = str(ctx.author.id)
     g = get_game(uid)
     if not g or g["type"] != "mines":
@@ -203,7 +241,7 @@ async def pick(ctx, number: int):
     if number in game["safe"]:
         game["picked"].append(number)
         game["safe_picks"] += 1
-        add_balance_db(uid, 2)  # +2 coins instantly
+        add_balance_db(uid, 2)
         set_game(uid, "mines", game)
         await ctx.send(f"✅ Safe! +2 coins. Safe picks: {game['safe_picks']}.")
     else:
@@ -212,19 +250,21 @@ async def pick(ctx, number: int):
 
 @bot.command()
 async def cashout(ctx):
+    if called_recently(ctx.author.id, "cashout"): return
     uid = str(ctx.author.id)
     g = get_game(uid)
     if not g or g["type"] != "mines":
         return await ctx.send("❌ You have no active mines game.")
     game = g["data"]
-    winnings = game["bet"] + (2 * game["safe_picks"])  # original bet is not returned earlier; we gave +2 per safe pick already
+    winnings = game["bet"] + (2 * game["safe_picks"])
     add_balance_db(uid, winnings)
     del_game(uid)
-    await ctx.send(f"💰 You cashed out {winnings} coins! Current balance: {get_balance_db(uid)}")
+    await ctx.send(f"💰 You cashed out {winnings} coins! Balance: {get_balance_db(uid)}")
 
-# --- DEPOSIT & PROOF FLOW ---
+# DEPOSIT & PROOF FLOW
 @bot.command()
 async def deposit(ctx):
+    if called_recently(ctx.author.id, "deposit"): return
     dm_text = (
         "**💸 Robux Deposit Options**\n\n"
         "2 Robux – https://www.roblox.com/game-pass/1232154663/Ty\n"
@@ -249,7 +289,7 @@ async def deposit(ctx):
 
 @bot.command()
 async def bought(ctx, amount: int):
-    # create pending proof entry (attachments empty for now)
+    if called_recently(ctx.author.id, "bought"): return
     ts = datetime.utcnow().isoformat()
     c.execute("INSERT INTO proofs (user_id, amount, attachments, ts) VALUES (?, ?, ?, ?)",
               (str(ctx.author.id), int(amount), json.dumps([]), ts))
@@ -258,33 +298,34 @@ async def bought(ctx, amount: int):
 
 @bot.command()
 async def boughtproof(ctx):
-    # look for most recent pending proof for this user with empty attachments
-    c.execute("SELECT id, amount FROM proofs WHERE user_id = ? AND attachments = ? ORDER BY id DESC LIMIT 1", (str(ctx.author.id), json.dumps([])))
+    if called_recently(ctx.author.id, "boughtproof"): return
+    # find last pending proof
+    c.execute("SELECT id, amount FROM proofs WHERE user_id = ? AND attachments = ? ORDER BY id DESC LIMIT 1",
+              (str(ctx.author.id), json.dumps([])))
     row = c.fetchone()
     if not row:
         return await ctx.send("❌ No pending purchase found. First run `.bought <amount>`.")
     proof_id, amount = row
     if not ctx.message.attachments:
-        return await ctx.send("❌ Please attach your screenshot(s) with `.boughtproof`.")
+        return await ctx.send("❌ Please attach screenshot(s) with `.boughtproof`.")
     attachments = [a.url for a in ctx.message.attachments]
     c.execute("UPDATE proofs SET attachments = ? WHERE id = ?", (json.dumps(attachments), proof_id))
     conn.commit()
-    # notify owners with embed + attachments
+    log_proof(ctx.author.id, amount, attachments)
+    # notify owners
     for owner in OWNER_IDS:
         try:
             user = await bot.fetch_user(int(owner))
-            embed = discord.Embed(title="Purchase Proof Received", color=0x00FF00)
+            embed = discord.Embed(title="Purchase Proof Received", color=0x00FF00, timestamp=datetime.utcnow())
             embed.add_field(name="User", value=f"{ctx.author} ({ctx.author.id})", inline=False)
             embed.add_field(name="Amount", value=str(amount), inline=False)
             embed.add_field(name="Time (UTC)", value=datetime.utcnow().isoformat(), inline=False)
-            embed.set_footer(text="Use .opgive <user> <amount> to reward after verification")
             await user.send(embed=embed)
             for url in attachments:
                 await user.send(url)
         except discord.Forbidden:
-            # owner can't be DM'd — skip
             pass
-    await ctx.send("✅ Proof submitted! Owners have been notified.")
+    await ctx.send("✅ Proof submitted — owners have been notified.")
 
 @bot.command()
 async def depositslist(ctx):
@@ -294,43 +335,45 @@ async def depositslist(ctx):
     if not deposits:
         return await ctx.send("📂 No deposits recorded.")
     lines = [f"<@{uid}>" for uid in deposits]
-    chunked = "\n".join(lines)
-    await ctx.send(f"💰 Users who used `.deposit`:\n{chunked}")
+    await ctx.send("💰 Users who used `.deposit`:\n" + "\n".join(lines))
 
-# --- COINFLIP (supports .coinflip <bet> <heads/tails> and shortcuts) ---
-async def do_coinflip(ctx, bet, guess):
+# COINFLIP (main + shortcuts)
+async def do_coinflip(ctx, bet: int, guess: str):
     uid = str(ctx.author.id)
     if bet < 1 or get_balance_db(uid) < bet:
         return await ctx.send("❌ Invalid bet or insufficient balance.")
-    # take bet
     add_balance_db(uid, -bet)
     result = random.choice(["heads", "tails"])
     await ctx.send("🪙 Flipping the coin...")
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(1.2)
     await ctx.send(f"Result: **{result}**")
     if guess.lower() == result:
         winnings = bet * 2
         add_balance_db(uid, winnings)
-        await ctx.send(f"🎉 You guessed correctly and won **{winnings} coins!**")
+        await ctx.send(f"🎉 You won **{winnings} coins!**")
     else:
-        await ctx.send(f"💀 You guessed wrong — you lost **{bet} coins.**")
+        await ctx.send(f"💀 You lost **{bet} coins.**")
 
 @bot.command()
 async def coinflip(ctx, bet: int, guess: str):
+    if called_recently(ctx.author.id, "coinflip"): return
     if guess.lower() not in ["heads", "tails"]:
         return await ctx.send("❌ Guess must be `heads` or `tails`.")
     await do_coinflip(ctx, bet, guess)
 
-@bot.command()
+# ------------- RUN -------------
+if TOKEN is None:
+    print("⚠️ TOKEN environment variable is not set. Set TOKEN before running.")
+else:
+    bot.run(TOKEN)
 async def heads(ctx, bet: int):
+    if called_recently(ctx.author.id, "heads"): return
     await do_coinflip(ctx, bet, "heads")
 
 @bot.command()
 async def tails(ctx, bet: int):
+    if called_recently(ctx.author.id, "tails"): return
     await do_coinflip(ctx, bet, "tails")
 
-# --- RUN ---
-if TOKEN is None:
-    print("⚠️ TOKEN not set. Set TOKEN environment variable in your host.")
-else:
+# ------------- RUN -------------
     bot.run(TOKEN)
